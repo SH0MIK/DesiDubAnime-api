@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from scrapling import Selector
+from playwright.async_api import async_playwright
 
 app = FastAPI(
     title="DesiDubAnime Scraping API",
@@ -497,10 +498,121 @@ async def get_episodes(
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+# NEW: Playwright-based m3u8 resolver
+async def resolve_m3u8_with_playwright(server_url: str) -> Optional[dict]:
+    """
+    Use Playwright to load the page with JavaScript enabled
+    and extract the m3u8 URL.
+    """
+    try:
+        async with async_playwright() as p:
+            # Launch browser
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            # Track m3u8 URLs from network requests
+            m3u8_urls = []
+            
+            async def on_response(response):
+                if '.m3u8' in response.url:
+                    m3u8_urls.append(response.url)
+                # Also check for redirects to m3u8
+                if response.status in [301, 302, 307, 308]:
+                    location = response.headers.get('location', '')
+                    if '.m3u8' in location:
+                        m3u8_urls.append(location)
+            
+            page.on('response', on_response)
+            
+            # Navigate to the server URL
+            await page.goto(server_url, wait_until='networkidle', timeout=30000)
+            
+            # Wait a bit for any delayed JavaScript loading
+            await page.wait_for_timeout(3000)
+            
+            # Try to find m3u8 in the page content (after JS execution)
+            content = await page.content()
+            
+            # Common patterns for m3u8 in JS-loaded content
+            patterns = [
+                r'(https?://[^\s"\']+\.m3u8[^\s"\']*)',
+                r'["\'](https?://[^\s"\']+\.m3u8[^\s"\']*)["\']',
+                r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'video:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'url:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'href:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'data-video-url=["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'src=["\']([^"\']+\.m3u8[^"\']*)["\']',
+            ]
+            
+            # Search in page content
+            for pattern in patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                if matches:
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            match = match[0]
+                        if match and '.m3u8' in match and match.startswith('http'):
+                            # Clean up the URL
+                            match = match.split('"')[0].split("'")[0].strip()
+                            if match.startswith('http'):
+                                await browser.close()
+                                return {
+                                    "source": "m3u8",
+                                    "url": match,
+                                    "quality": "auto"
+                                }
+            
+            # If found via network requests
+            if m3u8_urls:
+                await browser.close()
+                return {
+                    "source": "m3u8",
+                    "url": m3u8_urls[0],
+                    "quality": "auto"
+                }
+            
+            # Try to find video element sources
+            video_sources = await page.evaluate('''
+                () => {
+                    const videos = document.querySelectorAll('video source');
+                    const sources = [];
+                    videos.forEach(v => {
+                        if (v.src && v.src.includes('.m3u8')) {
+                            sources.push(v.src);
+                        }
+                    });
+                    return sources;
+                }
+            ''')
+            
+            if video_sources and len(video_sources) > 0:
+                await browser.close()
+                return {
+                    "source": "m3u8",
+                    "url": video_sources[0],
+                    "quality": "auto"
+                }
+            
+            await browser.close()
+            return None
+            
+    except Exception as e:
+        print(f"Playwright error for {server_url}: {str(e)}")
+        return None
+
+# Updated watch endpoint with m3u8 resolution
 @app.get("/api/watch/{episode_slug}")
 async def get_episode_watch_servers(episode_slug: str):
     url = f"{BASE_URL}watch/{episode_slug}/"
-    async with httpx.AsyncClient(headers=HEADERS, timeout=20) as client:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
         try:
             r = await client.get(url)
             if r.status_code != 200:
@@ -520,10 +632,13 @@ async def get_episode_watch_servers(episode_slug: str):
                         if iframe_src_match:
                             url_val = iframe_src_match.group(1)
                     
-                    servers.append({
+                    server_entry = {
                         "name": decoded["name"],
-                        "url": url_val
-                    })
+                        "url": url_val,
+                        "source_found": False
+                    }
+                    
+                    servers.append(server_entry)
                     
             # Check for GDMirrorBot embeds to fetch other mirrors dynamically
             for s in list(servers):
@@ -536,12 +651,31 @@ async def get_episode_watch_servers(episode_slug: str):
                         for m in mirrors:
                             # Avoid duplicates
                             if not any(x.get("url") == m["url"] for x in servers):
-                                servers.append(m)
-                                
+                                servers.append({
+                                    "name": m["name"],
+                                    "url": m["url"],
+                                    "source_found": False
+                                })
+            
+            # Now resolve m3u8 for each server (limit to first 5 to avoid timeouts)
+            resolved_count = 0
+            for i, server in enumerate(servers[:10]):  # Only try first 10 servers
+                try:
+                    m3u8_result = await resolve_m3u8_with_playwright(server["url"])
+                    if m3u8_result:
+                        server["source_found"] = True
+                        server["m3u8"] = m3u8_result
+                        resolved_count += 1
+                except Exception as e:
+                    print(f"Error resolving {server['name']}: {str(e)}")
+                    continue
+            
             return {
                 "episode_slug": episode_slug,
                 "url": url,
-                "servers": servers
+                "servers": servers,
+                "total_servers": len(servers),
+                "resolved_servers": resolved_count
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
