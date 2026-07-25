@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from scrapling import Selector
+from playwright.async_api import async_playwright
 
 app = FastAPI(
     title="DesiDubAnime Scraping API",
@@ -28,12 +29,7 @@ AJAX_URL = "https://www.desidubanime.me/wp-admin/admin-ajax.php"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": BASE_URL,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1"
+    "Referer": BASE_URL
 }
 
 # Helper to decode base64 embeds
@@ -502,158 +498,143 @@ async def get_episodes(
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-# SIMPLIFIED: Direct m3u8 resolution using httpx (no Playwright needed)
-async def resolve_m3u8_httpx(client: httpx.AsyncClient, server_url: str) -> Optional[dict]:
+# NEW: Get servers using Playwright (this actually works)
+async def get_servers_with_playwright(episode_slug: str) -> List[dict]:
     """
-    Try to find m3u8 URL by fetching the page and looking for patterns.
-    This is faster and doesn't require a browser.
+    Use Playwright to load the watch page and extract server data from data-embed-id attributes
     """
+    url = f"{BASE_URL}watch/{episode_slug}/"
+    
     try:
-        # Clean up URL - remove hash fragments
-        clean_url = server_url.split('#')[0]
-        
-        # Fetch with proper headers and follow redirects
-        resp = await client.get(clean_url, headers=HEADERS, follow_redirects=True, timeout=15)
-        
-        if resp.status_code != 200:
-            return None
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={'width': 1280, 'height': 720}
+            )
+            page = await context.new_page()
             
-        html = resp.text
-        
-        # Look for m3u8 patterns
-        patterns = [
-            r'(https?://[^\s"\']+\.m3u8[^\s"\']*)',
-            r'(https?://[^\s"\']+\.m3u8\?[^\s"\']*)',
-            r'src=["\']([^"\']+\.m3u8[^"\']*)["\']',
-            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-            r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-            r'video:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-            r'url:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-            r'data-video-url=["\']([^"\']+\.m3u8[^"\']*)["\']',
-            # Specific to some players
-            r'\|([^|]+\.m3u8)',
-            r'"file":"([^"]+\.m3u8[^"]*)"',
-            r'"url":"([^"]+\.m3u8[^"]*)"',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            if matches:
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    if match and '.m3u8' in match:
-                        # Clean up the URL
-                        match = match.split('"')[0].split("'")[0].strip()
-                        # Handle relative URLs
-                        if not match.startswith('http'):
-                            if match.startswith('//'):
-                                match = f"https:{match}"
-                            else:
-                                # Try to construct absolute URL
-                                base = '/'.join(clean_url.split('/')[:3])
-                                if match.startswith('/'):
-                                    match = f"{base}{match}"
-                                else:
-                                    match = f"{base}/{match}"
+            # Navigate to the watch page
+            await page.goto(url, wait_until='networkidle', timeout=30000)
+            
+            # Wait for the server buttons to load (they might be injected by JS)
+            # Look for elements with data-embed-id attribute
+            try:
+                await page.wait_for_selector('[data-embed-id]', timeout=10000)
+            except:
+                # If no data-embed-id found, wait for the DUB section
+                await page.wait_for_selector('text=DUB:', timeout=5000)
+            
+            # Get all elements with data-embed-id
+            elements = await page.query_selector_all('[data-embed-id]')
+            
+            servers = []
+            for el in elements:
+                embed_id = await el.get_attribute('data-embed-id')
+                if embed_id:
+                    decoded = decode_base64_embed(embed_id)
+                    if decoded:
+                        url_val = decoded["url"]
+                        if "<iframe" in url_val.lower():
+                            iframe_src_match = re.search(r"src=['\"]([^'\"]+)['\"]", url_val, re.IGNORECASE)
+                            if iframe_src_match:
+                                url_val = iframe_src_match.group(1)
                         
-                        if match.startswith('http') and '.m3u8' in match:
-                            return {
-                                "source": "m3u8",
-                                "url": match,
-                                "quality": "auto"
-                            }
-        
-        # Check for redirects to m3u8
-        if resp.history:
-            for h in resp.history:
-                if '.m3u8' in str(h.url):
-                    return {
-                        "source": "m3u8",
-                        "url": str(h.url),
-                        "quality": "auto"
-                    }
-        
-        return None
-        
+                        servers.append({
+                            "name": decoded["name"],
+                            "url": url_val
+                        })
+            
+            await browser.close()
+            return servers
+            
     except Exception as e:
-        print(f"Error resolving {server_url}: {str(e)}")
-        return None
+        print(f"Playwright error: {str(e)}")
+        return []
 
-# Updated watch endpoint
+# Updated watch endpoint with Playwright
 @app.get("/api/watch/{episode_slug}")
 async def get_episode_watch_servers(episode_slug: str):
     url = f"{BASE_URL}watch/{episode_slug}/"
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True) as client:
-        try:
-            r = await client.get(url)
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=f"Episode '{episode_slug}' not found")
-            
-            sel = Selector(r.text)
-            servers = []
-            
-            # Extract standard data-embed-id elements
-            for el in sel.css("[data-embed-id]"):
-                decoded = decode_base64_embed(el.attrib.get("data-embed-id"))
-                if decoded:
-                    # Clean tags if there are script iframes inside url field
-                    url_val = decoded["url"]
-                    if "<iframe" in url_val.lower():
-                        iframe_src_match = re.search(r"src=['\"]([^'\"]+)['\"]", url_val, re.IGNORECASE)
-                        if iframe_src_match:
-                            url_val = iframe_src_match.group(1)
-                    
-                    server_entry = {
-                        "name": decoded["name"],
-                        "url": url_val,
-                        "source_found": False
-                    }
-                    
-                    servers.append(server_entry)
-                    
-            # Check for GDMirrorBot embeds to fetch other mirrors dynamically
-            for s in list(servers):
-                embed_url = s.get("url", "")
-                if "gdmirrorbot.nl" in embed_url:
-                    sid_match = re.search(r'/embed/([^/]+)', embed_url)
-                    if sid_match:
-                        sid = sid_match.group(1)
-                        mirrors = await fetch_embedhelper_sources(client, sid)
-                        for m in mirrors:
-                            # Avoid duplicates
-                            if not any(x.get("url") == m["url"] for x in servers):
-                                servers.append({
-                                    "name": m["name"],
-                                    "url": m["url"],
-                                    "source_found": False
-                                })
-            
-            # Try to resolve m3u8 for each server (limit to 10 to avoid too many requests)
-            resolved_count = 0
-            for i, server in enumerate(servers):
-                if i >= 10:  # Only try first 10 servers
-                    break
-                    
+    
+    try:
+        # First, try to get servers using Playwright
+        servers = await get_servers_with_playwright(episode_slug)
+        
+        # If Playwright returns no servers, try the old method as fallback
+        if not servers:
+            async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    raise HTTPException(status_code=r.status_code, detail=f"Episode '{episode_slug}' not found")
+                
+                sel = Selector(r.text)
+                
+                # Try to extract from data-embed-id using Scrapling
+                for el in sel.css("[data-embed-id]"):
+                    decoded = decode_base64_embed(el.attrib.get("data-embed-id"))
+                    if decoded:
+                        url_val = decoded["url"]
+                        if "<iframe" in url_val.lower():
+                            iframe_src_match = re.search(r"src=['\"]([^'\"]+)['\"]", url_val, re.IGNORECASE)
+                            if iframe_src_match:
+                                url_val = iframe_src_match.group(1)
+                        
+                        servers.append({
+                            "name": decoded["name"],
+                            "url": url_val
+                        })
+        
+        # Now try to resolve m3u8 for each server (limit to 5 to avoid timeouts)
+        resolved_servers = []
+        async with httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+            for server in servers[:5]:
                 try:
-                    m3u8_result = await resolve_m3u8_httpx(client, server["url"])
-                    if m3u8_result:
-                        server["source_found"] = True
-                        server["m3u8"] = m3u8_result
-                        resolved_count += 1
+                    # Try to fetch the server URL and find m3u8
+                    clean_url = server["url"].split('#')[0]
+                    resp = await client.get(clean_url, timeout=15)
+                    
+                    if resp.status_code == 200:
+                        html = resp.text
+                        # Look for m3u8 patterns
+                        patterns = [
+                            r'(https?://[^\s"\']+\.m3u8[^\s"\']*)',
+                            r'src=["\']([^"\']+\.m3u8[^"\']*)["\']',
+                            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                            r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                            r'video:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                            r'url:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                        ]
+                        
+                        for pattern in patterns:
+                            matches = re.findall(pattern, html, re.IGNORECASE)
+                            if matches:
+                                for match in matches:
+                                    if isinstance(match, tuple):
+                                        match = match[0]
+                                    if match and '.m3u8' in match and match.startswith('http'):
+                                        server["m3u8"] = match
+                                        server["resolved"] = True
+                                        break
+                            if server.get("resolved"):
+                                break
                 except Exception as e:
                     print(f"Error resolving {server['name']}: {str(e)}")
-                    continue
-            
-            return {
-                "episode_slug": episode_slug,
-                "url": url,
-                "servers": servers,
-                "total_servers": len(servers),
-                "resolved_servers": resolved_count
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+                
+                resolved_servers.append(server)
+        
+        return {
+            "episode_slug": episode_slug,
+            "url": url,
+            "servers": resolved_servers,
+            "total_servers": len(resolved_servers),
+            "resolved_servers": len([s for s in resolved_servers if s.get("resolved")])
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/search/instant")
 async def get_instant_search(query: str = Query(..., description="Query keyword")):
